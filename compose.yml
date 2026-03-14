@@ -1,14 +1,16 @@
 services:
   meshgate-bridge:
-    image: eclipse-mosquitto:2
+build: ./meshgate-bridge
+    image: meshgate-bridge:latest
     container_name: meshgate-bridge
     restart: unless-stopped
-    pull_policy: always
+    env_file:
+      - .env
     environment:
       - TZ=Asia/Taipei
+- MESHGATE_BRIDGE_CONNECTION_NAME=${MESHGATE_BRIDGE_CONNECTION_NAME}
     volumes:
-      - ./meshgate-bridge/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
-      - /etc/ssl/certs:/etc/ssl/certs:ro # 系統 SSL 憑證 (橋接 8883 必備)
+            - /etc/ssl/certs:/etc/ssl/certs:ro # 系統 SSL 憑證 (橋接 8883 必備)
       - ./storage/meshgate-bridge/log:/mosquitto/log
     deploy:
       resources:
