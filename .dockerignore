@@ -1,0 +1,43 @@
+# Docker 相關檔案
+Dockerfile
+.dockerignore
+compose.yml
+docker-compose*.yml
+
+# 環境變數檔案
+.env
+.env*.local
+.env.development
+.env.test
+.env.production
+
+# Git 相關
+.git
+.gitignore
+.gitattributes
+.git-credentials
+
+# IDE 和編輯器
+.vscode
+.idea
+*.swp
+*.swo
+*~
+.DS_Store
+*.sublime-project
+*.sublime-workspace
+
+# 日誌檔案
+*.log
+logs
+
+# 檔案
+README.md
+*.md
+docs
+
+# 其他
+*.pem
+.cache
+.temp
+.tmp
