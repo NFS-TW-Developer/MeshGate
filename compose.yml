@@ -1,0 +1,95 @@
+services:
+  meshgate-bridge:
+    image: eclipse-mosquitto:2
+    container_name: meshgate-bridge
+    restart: unless-stopped
+    pull_policy: always
+    environment:
+      - TZ=Asia/Taipei
+    volumes:
+      - ./meshgate-bridge/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - /etc/ssl/certs:/etc/ssl/certs:ro # 系統 SSL 憑證 (橋接 8883 必備)
+      - ./storage/meshgate-bridge/log:/mosquitto/log
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "mosquitto_sub",
+          "-t",
+          "$$SYS/broker/version",
+          "-C",
+          "1",
+          "-W",
+          "3",
+          "-h",
+          "127.0.0.1",
+          "-p",
+          "1883",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    networks:
+      - meshgate-network
+  meshgate-broker:
+    image: emqx/emqx:5.8
+    container_name: meshgate-broker
+    restart: unless-stopped
+    pull_policy: always
+    ports:
+      - 1883:1883
+      # - 8083:8083
+      # - 8084:8084
+      # - 8883:8883
+      - 18083:18083
+    env_file:
+      - .env
+    environment:
+      - "EMQX_DASHBOARD__DEFAULT_PASSWORD=${MESHGATE_BROKER_PASSWORD}" # 後台密碼
+      # 基礎設定
+      - "EMQX_NODE_NAME=emqx@meshgate-broker" # 節點名稱
+      - "EMQX_AUTH__ALLOW_ANONYMOUS=false" # 停用匿名登入
+      - "EMQX_LISTENER__WS__DEFAULT__BIND=0" # 關閉 WebSocket 8083
+      - "EMQX_LISTENER__WSS__DEFAULT__BIND=0" # 關閉 WSS 8084
+    volumes:
+      - /etc/ssl/certs/ca-certificates.crt:/opt/emqx/etc/certs/cacert.pem:ro
+      - ./storage/meshgate-broker/data:/opt/emqx/data
+      - ./storage/meshgate-broker/log:/opt/emqx/log
+      - ./meshgate-broker/acl.conf:/opt/emqx/data/authz/acl.conf:ro
+      - ./meshgate-broker/cluster.hocon:/opt/emqx/data/configs/cluster.hocon:ro
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:18083/api/v5/status"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 40s
+    depends_on:
+      - meshgate-bridge
+    networks:
+      - meshgate-network
+  meshgate-filter:
+    build: ./meshgate-filter
+    container_name: meshgate-filter
+    restart: unless-stopped
+    command: ["sh", "-c", "sleep 10 && exec python -u main.py"]
+    env_file:
+      - .env
+    environment:
+      - "MESHGATE_BROKER_API_KEY=${MESHGATE_BROKER_API_KEY}"
+      - "MESHGATE_BROKER_API_SECRET=${MESHGATE_BROKER_API_SECRET}"
+    depends_on:
+      meshgate-bridge:
+        condition: service_healthy
+      meshgate-broker:
+        condition: service_healthy
+    networks:
+      - meshgate-network
+
+networks:
+  meshgate-network:
+    external: true

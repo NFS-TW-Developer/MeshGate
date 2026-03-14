@@ -1,0 +1,31 @@
+# Meshgate 過濾網關設定：轉發至本地 EMQX Broker，並過濾特定節點
+# 修改後重啟容器即可生效
+
+# 日誌等級：DEBUG / INFO / WARNING / ERROR（也可用環境變數 LOG_LEVEL 覆寫）
+logging:
+  level: INFO
+
+# 訂閱來源：本地 bridge (meshgate-bridge)，bridge 已橋接官方，內網不需 TLS
+source:
+  host: meshgate-bridge
+  port: 1883
+  tls: false
+  username: ""
+  password: ""
+  topic: "msh/TW/#"
+
+# 本地 EMQX Broker（連線參數 + Fan-out 用 EMQX API）
+local:
+  host: meshgate-broker
+  port: 1883
+  username: "LOCAL_BRIDGE"   # 必填
+  password: "LOCAL_BRIDGE"   # 必填
+  # EMQX Management API（必填）：取得在線節點，轉發到 msh/TW/node/!{node_id}{path}
+  # api_key / api_secret 由環境變數 MESHGATE_BROKER_API_KEY、MESHGATE_BROKER_API_SECRET 提供
+  api_url: "http://meshgate-broker:18083"
+
+# 過濾規則（ignoreId 為解包後依 from 排除）
+filter:
+  ignoreId:
+    - "2661414656" # !9ea1f700 🍁番仔園
+    - "2997292716" # !b2a70eac MeshAI 🔌天台🔌
