@@ -104,7 +104,7 @@ rule_engine {
       actions = [
         "mqtt:forward_to_bridge"
       ]
-      description = "「出站規則」將本地訊息同步至官方，攔截回流訊息"
+      description = "「出站規則」將本地訊息同步至 bridge，攔截回流訊息"
       enable = true
       metadata {last_modified_at = 0}
       name = ""
