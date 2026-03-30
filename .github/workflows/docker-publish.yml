@@ -21,9 +21,15 @@ jobs:
           - name: bridge
             context: ./meshgate-bridge
             dockerfile: ./meshgate-bridge/Dockerfile
+            image: meshgate-bridge
           - name: filter
             context: ./meshgate-filter
             dockerfile: ./meshgate-filter/Dockerfile
+            image: meshgate-filter
+          - name: broker
+            context: ./meshgate-broker
+            dockerfile: ./meshgate-broker/Dockerfile
+            image: meshgate-broker
 
     steps:
       - name: Checkout
@@ -47,7 +53,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}-${{ matrix.name }}
+          images: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=ref,event=tag
