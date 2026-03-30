@@ -1,16 +1,18 @@
 services:
   meshgate-bridge:
-build: ./meshgate-bridge
-    image: meshgate-bridge:latest
+    # build: ./meshgate-bridge
+    # image: meshgate-bridge:latest
+    image: ghcr.io/nfs-tw-developer/meshgate-bridge:latest
     container_name: meshgate-bridge
     restart: unless-stopped
+    pull_policy: always
     env_file:
       - .env
     environment:
       - TZ=Asia/Taipei
-- MESHGATE_BRIDGE_CONNECTION_NAME=${MESHGATE_BRIDGE_CONNECTION_NAME}
+      - MESHGATE_BRIDGE_CONNECTION_NAME=${MESHGATE_BRIDGE_CONNECTION_NAME}
     volumes:
-            - /etc/ssl/certs:/etc/ssl/certs:ro # 系統 SSL 憑證 (橋接 8883 必備)
+      - /etc/ssl/certs:/etc/ssl/certs:ro # 系統 SSL 憑證 (橋接 8883 必備)
       - ./storage/meshgate-bridge/log:/mosquitto/log
     deploy:
       resources:
@@ -75,9 +77,12 @@ build: ./meshgate-bridge
     networks:
       - meshgate-network
   meshgate-filter:
-    build: ./meshgate-filter
+    # build: ./meshgate-filter
+    # image: meshgate-filter:latest
+    image: ghcr.io/nfs-tw-developer/meshgate-filter:latest
     container_name: meshgate-filter
     restart: unless-stopped
+    pull_policy: always
     command: ["sh", "-c", "sleep 10 && exec python -u main.py"]
     env_file:
       - .env
