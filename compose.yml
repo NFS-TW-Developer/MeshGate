@@ -41,16 +41,18 @@ services:
     networks:
       - meshgate-network
   meshgate-broker:
-    image: emqx/emqx:5.8
+    # build: ./meshgate-broker
+    # image: meshgate-broker:latest
+    image: ghcr.io/nfs-tw-developer/meshgate-broker:latest
     container_name: meshgate-broker
     restart: unless-stopped
     pull_policy: always
-    ports:
-      - 1883:1883
-      # - 8083:8083
-      # - 8084:8084
-      # - 8883:8883
-      - 18083:18083
+    # ports:
+    #   # - 1883:1883
+    #   # - 8083:8083
+    #   # - 8084:8084
+    #   # - 8883:8883
+    #   # - 18083:18083
     env_file:
       - .env
     environment:
@@ -64,8 +66,6 @@ services:
       - /etc/ssl/certs/ca-certificates.crt:/opt/emqx/etc/certs/cacert.pem:ro
       - ./storage/meshgate-broker/data:/opt/emqx/data
       - ./storage/meshgate-broker/log:/opt/emqx/log
-      - ./meshgate-broker/acl.conf:/opt/emqx/data/authz/acl.conf:ro
-      - ./meshgate-broker/cluster.hocon:/opt/emqx/data/configs/cluster.hocon:ro
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://127.0.0.1:18083/api/v5/status"]
       interval: 10s
