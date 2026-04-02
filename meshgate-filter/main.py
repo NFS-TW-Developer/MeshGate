@@ -129,42 +129,81 @@ def should_drop(config: dict, topic: str) -> tuple[bool, str | None]:
 
 def should_drop_by_packet_from(
     config: dict, payload: bytes
-) -> tuple[bool, int | None, int | None, bool]:
+) -> tuple[bool, int | None, int | None, bool, int | None, int | None]:
     """
     解包 ServiceEnvelope，依 rx_time 過期、from 規則判斷是否丟棄，並回傳 from_id / packet_id 供去重用。
-    回傳 (是否丟棄, from_id 或 None, packet_id 或 None, 是否因過期丟棄)。
+    回傳 (是否丟棄, from_id 或 None, packet_id 或 None, 是否因過期丟棄, rx_time 或 None, age_seconds 或 None)。
     """
     try:
         se = mqtt_pb2.ServiceEnvelope()
         se.ParseFromString(payload)
         mp = se.packet
         rx_time = getattr(mp, "rx_time", None)
+        age_seconds = None
+        if rx_time is not None and rx_time > 0:
+            age_seconds = int(time.time() - rx_time)
         if (
             rx_time is not None
             and rx_time > 0
-            and (time.time() - rx_time) > RX_TIME_MAX_AGE_SECONDS
+            and age_seconds is not None
+            and age_seconds > RX_TIME_MAX_AGE_SECONDS
         ):
-            return True, getattr(mp, "from", None), getattr(mp, "id", None), True
+            return (
+                True,
+                getattr(mp, "from", None),
+                getattr(mp, "id", None),
+                True,
+                int(rx_time),
+                age_seconds,
+            )
         from_id = getattr(mp, "from", None)
         packet_id = getattr(mp, "id", None)
         if from_id is None:
-            return False, None, None, False
+            return (
+                False,
+                None,
+                None,
+                False,
+                int(rx_time) if rx_time else None,
+                age_seconds,
+            )
         from_id_str = str(from_id)
         from_hex = format(from_id, "08x").lower()
         for kw in EXCLUDE_NODE_ID_CONTAINS:
             fragment = kw.lstrip("!").lower()
             if fragment and from_hex.startswith(fragment):
-                return True, from_id, None, False
+                return (
+                    True,
+                    from_id,
+                    None,
+                    False,
+                    int(rx_time) if rx_time else None,
+                    age_seconds,
+                )
         ignore_ids_raw = [
             s.strip() for s in config.get("filter", {}).get("ignoreId", []) if s
         ]
         for s in ignore_ids_raw:
             s_lower = s.lower()
             if from_id_str == s or from_hex == s_lower:
-                return True, from_id, None, False
-        return False, from_id, packet_id, False
+                return (
+                    True,
+                    from_id,
+                    None,
+                    False,
+                    int(rx_time) if rx_time else None,
+                    age_seconds,
+                )
+        return (
+            False,
+            from_id,
+            packet_id,
+            False,
+            int(rx_time) if rx_time else None,
+            age_seconds,
+        )
     except Exception:
-        return False, None, None, False
+        return False, None, None, False, None, None
 
 
 # ---------------------------------------------------------------------------
@@ -341,14 +380,37 @@ async def run_async():
                         payload = message.payload
                         if not payload:
                             continue
-                        dropped_by_from, from_id, packet_id, expired = (
-                            should_drop_by_packet_from(config, payload)
-                        )
+                        (
+                            dropped_by_from,
+                            from_id,
+                            packet_id,
+                            expired,
+                            rx_time,
+                            age_seconds,
+                        ) = should_drop_by_packet_from(config, payload)
                         if dropped_by_from:
                             if expired:
+                                rx_time_str = (
+                                    time.strftime(
+                                        "%Y-%m-%d %H:%M:%S", time.localtime(rx_time)
+                                    )
+                                    if rx_time is not None
+                                    else "unknown"
+                                )
+                                now_local_str = time.strftime(
+                                    "%Y-%m-%d %H:%M:%S", time.localtime()
+                                )
                                 logger.warning(
-                                    "過濾(過期): topic=%s rx_time>%ds",
+                                    "過濾(過期): topic=%s packet_rx_time_local=%s packet_rx_time_epoch=%s now_local=%s packet_age=%ss max_age=%ss reason=packet_too_old",
                                     topic,
+                                    rx_time_str,
+                                    rx_time if rx_time is not None else "unknown",
+                                    now_local_str,
+                                    (
+                                        age_seconds
+                                        if age_seconds is not None
+                                        else "unknown"
+                                    ),
                                     RX_TIME_MAX_AGE_SECONDS,
                                 )
                             elif from_id is not None:
