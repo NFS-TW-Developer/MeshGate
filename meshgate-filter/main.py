@@ -28,9 +28,11 @@ except ImportError:
     MqttError = type("MqttError", (Exception,), {})  # noqa: no cover
 
 try:
-    from meshtastic import mqtt_pb2
+    from meshtastic import mesh_pb2, mqtt_pb2
 except ImportError:
-    from meshtastic.protobuf import mqtt_pb2
+    from meshtastic.protobuf import mesh_pb2, mqtt_pb2
+
+from google.protobuf.text_format import MessageToString
 
 # ---------------------------------------------------------------------------
 # 設定與常數
@@ -163,83 +165,75 @@ def should_drop(config: dict, topic: str) -> tuple[bool, str | None]:
     return False, None
 
 
-def should_drop_by_packet_from(
-    config: dict, payload: bytes
-) -> tuple[bool, int | None, int | None, bool, int | None, int | None]:
-    """
-    解包 ServiceEnvelope，依 rx_time 過期、from 規則判斷是否丟棄，並回傳 from_id / packet_id 供去重用。
-    回傳 (是否丟棄, from_id 或 None, packet_id 或 None, 是否因過期丟棄, rx_time 或 None, age_seconds 或 None)。
-    from 比對順序：過期 → EXCLUDE_NODE_ID_CONTAINS（hex 前綴）→ filter.ignoreId。
-    """
+def _mesh_packet_from_payload(payload: bytes) -> mesh_pb2.MeshPacket | None:
+    """由 MQTT payload 解出 ServiceEnvelope，回傳內嵌 MeshPacket。"""
     try:
         se = mqtt_pb2.ServiceEnvelope()
         se.ParseFromString(payload)
-        mp = se.packet
-        rx_time = getattr(mp, "rx_time", None)
-        age_seconds = None
-        if rx_time is not None and rx_time > 0:
-            age_seconds = int(time.time() - rx_time)
-        if (
-            rx_time is not None
-            and rx_time > 0
-            and age_seconds is not None
-            and age_seconds > RX_TIME_MAX_AGE_SECONDS
-        ):
-            return (
-                True,
-                getattr(mp, "from", None),
-                getattr(mp, "id", None),
-                True,
-                int(rx_time),
-                age_seconds,
-            )
+        return se.packet
+    except Exception:
+        return None
+
+
+def _mesh_packet_one_line(mp: mesh_pb2.MeshPacket | None) -> str:
+    """protobuf TextFormat 單行（日誌不換行）。"""
+    if mp is None:
+        return "None"
+    return MessageToString(mp, as_one_line=True)
+
+
+def packet_rx_time_expired(
+    mp: mesh_pb2.MeshPacket | None,
+) -> tuple[bool, int | None, int | None]:
+    """
+    依封包 rx_time 與 RX_TIME_MAX_AGE_SECONDS 判斷是否過期。
+    回傳 (是否過期, rx_time 或 None, age_seconds 或 None)。mp 為 None 時視為未過期。
+    """
+    if mp is None:
+        return False, None, None
+    rx_time = getattr(mp, "rx_time", None)
+    age_seconds = None
+    if rx_time is not None and rx_time > 0:
+        age_seconds = int(time.time() - rx_time)
+    if (
+        rx_time is not None
+        and rx_time > 0
+        and age_seconds is not None
+        and age_seconds > RX_TIME_MAX_AGE_SECONDS
+    ):
+        return True, int(rx_time), age_seconds
+    return False, int(rx_time) if rx_time else None, age_seconds
+
+
+def should_drop_by_packet_from(
+    config: dict, mp: mesh_pb2.MeshPacket | None
+) -> tuple[bool, int | None, int | None]:
+    """
+    僅依封包 from 與 EXCLUDE_NODE_ID_CONTAINS、filter.ignoreId 判斷是否丟棄（不含 rx_time 過期）。
+    回傳 (是否丟棄, from_id 或 None, packet_id 或 None)。
+    """
+    try:
+        if mp is None:
+            return False, None, None
         from_id = getattr(mp, "from", None)
         packet_id = getattr(mp, "id", None)
         if from_id is None:
-            return (
-                False,
-                None,
-                None,
-                False,
-                int(rx_time) if rx_time else None,
-                age_seconds,
-            )
+            return False, None, None
         from_id_str = str(from_id)
         from_hex = format(from_id, "08x").lower()
         for kw in EXCLUDE_NODE_ID_CONTAINS:
             fragment = kw.lstrip("!").lower()
             if fragment and from_hex.startswith(fragment):
-                return (
-                    True,
-                    from_id,
-                    packet_id,
-                    False,
-                    int(rx_time) if rx_time else None,
-                    age_seconds,
-                )
+                return True, from_id, packet_id
         ignore_ids_raw = [
             s.strip() for s in config.get("filter", {}).get("ignoreId", []) if s
         ]
         for s in ignore_ids_raw:
             if from_id_str == s or from_hex == s.lower():
-                return (
-                    True,
-                    from_id,
-                    packet_id,
-                    False,
-                    int(rx_time) if rx_time else None,
-                    age_seconds,
-                )
-        return (
-            False,
-            from_id,
-            packet_id,
-            False,
-            int(rx_time) if rx_time else None,
-            age_seconds,
-        )
+                return True, from_id, packet_id
+        return False, from_id, packet_id
     except Exception:
-        return False, None, None, False, None, None
+        return False, None, None
 
 
 # ---------------------------------------------------------------------------
@@ -457,16 +451,6 @@ async def run_async(config: dict) -> None:
                         payload = message.payload
                         if not payload:
                             continue
-                        qos = message.qos or 0
-                        retain = message.retain or False
-                        (
-                            dropped_by_from,
-                            from_id,
-                            packet_id,
-                            expired,
-                            rx_time,
-                            age_seconds,
-                        ) = should_drop_by_packet_from(config, payload)
                         # 1. 不支援的路徑（非預期 msh/TW/... 分段形狀或 path 萃取失敗）→ 略過
                         if not is_supported_meshtastic_topic_shape(topic):
                             logger.warning("過濾(unsupported_path): %s", topic)
@@ -477,10 +461,17 @@ async def run_async(config: dict) -> None:
                                 "過濾(unsupported_path): %s (path 萃取失敗)", topic
                             )
                             continue
-                        # 2. 丟棄過期封包
-                        if dropped_by_from and expired:
+                        mesh_packet = _mesh_packet_from_payload(payload)
+                        expired, rx_time, age_seconds = packet_rx_time_expired(
+                            mesh_packet
+                        )
+                        # 2. 丟棄過期封包（僅 rx_time，與 should_drop_by_packet_from 無關）
+                        if expired:
                             _log_expired_packet(topic, rx_time, age_seconds)
                             continue
+                        drop_by_from, from_id, packet_id = should_drop_by_packet_from(
+                            config, mesh_packet
+                        )
                         # 3. 丟棄已處理過的封包（去重）
                         if (
                             from_id is not None
@@ -488,15 +479,26 @@ async def run_async(config: dict) -> None:
                             and _dedup_is_duplicate(from_id, packet_id)
                         ):
                             continue
-                        # 4. 封包層過濾 → 略過
-                        if dropped_by_from:
+                        # 4. 封包層過濾（exclude / ignoreId）→ 略過
+                        if drop_by_from:
                             if from_id is not None:
                                 from_hex = format(from_id, "08x").lower()
                                 logger.warning(
-                                    "過濾(ignoreId/from): topic=%s from=%s (!%s)",
+                                    "過濾(ignoreId/from): topic=%s qos=%s retain=%s from=%s (!%s) mesh_packet=%s",
                                     topic,
+                                    message.qos,
+                                    message.retain or False,
                                     from_id,
                                     from_hex,
+                                    _mesh_packet_one_line(mesh_packet),
+                                )
+                            else:
+                                logger.warning(
+                                    "過濾(ignoreId/from): topic=%s qos=%s retain=%s from_id=None mesh_packet=%s",
+                                    topic,
+                                    message.qos,
+                                    message.retain or False,
+                                    _mesh_packet_one_line(mesh_packet),
                                 )
                             _dedup_mark_seen_if_present(from_id, packet_id)
                             continue
@@ -528,8 +530,8 @@ async def run_async(config: dict) -> None:
                         await local_client.publish(
                             main_topic,
                             payload=payload,
-                            qos=qos,
-                            retain=retain,
+                            qos=message.qos,
+                            retain=message.retain or False,
                         )
                         _dedup_mark_seen_if_present(from_id, packet_id)
                         # 僅 path 以 /2/e/ 開頭時才 fan-out 給節點（/2/json/、/2/map 只發 main）
@@ -550,8 +552,8 @@ async def run_async(config: dict) -> None:
                                 await local_client.publish(
                                     target,
                                     payload=payload,
-                                    qos=qos,
-                                    retain=retain,
+                                    qos=message.qos,
+                                    retain=message.retain or False,
                                 )
                                 sent_count += 1
                             logger.info(
