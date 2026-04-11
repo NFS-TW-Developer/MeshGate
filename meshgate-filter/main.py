@@ -2,7 +2,7 @@
 """
 Meshgate 過濾網關：從本地 bridge 訂閱，過濾後轉發至本地 EMQX Broker。
 設定由 config.yaml 讀取，使用 aiomqtt 非同步連線。
-支援解析 ServiceEnvelope 依封包 from 比對 ignoreId、封包 ID 去重。
+支援解析 ServiceEnvelope 依封包 from 比對 ignoreId；同一 (from_id, packet_id) 在 TTL 內僅處理一次。
 Fan-out 模式：需 local.api_url / api_key / api_secret，轉發至 msh/TW{path} 與 msh/TW/node/!{node_id}{path}。
 """
 import asyncio
@@ -17,10 +17,10 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-logger = logging.getLogger("meshgate_filter")
-
 import aiomqtt
 import yaml
+
+logger = logging.getLogger("meshgate_filter")
 
 try:
     from aiomqtt.exceptions import MqttError
@@ -44,7 +44,7 @@ EXCLUDE_NODE_ID_CONTAINS = ("!abcd",)
 REQUIRE_VALID_NODE_OR_MAP = True
 
 RX_TIME_MAX_AGE_SECONDS = 300  # rx_time 超過此秒數視為過期，不轉發
-DEDUP_TTL_SECONDS = 30  # 去重 (from_id, packet_id) TTL
+DEDUP_TTL_SECONDS = 30  # 同一 (from_id, packet_id) 僅處理一次；TTL 內重複訊息直接略過
 ONLINE_NODES_REFRESH_SECONDS = 10  # 在線節點 API 更新間隔（秒）
 
 # 轉發 path：main 用三種 path；僅 /2/e/ 會 fan-out 到節點
@@ -95,6 +95,34 @@ def _dedup_mark_seen(from_id: int, packet_id: int) -> None:
     _dedup_expire_at.append((time.monotonic() + DEDUP_TTL_SECONDS, key))
 
 
+def _dedup_mark_seen_if_present(from_id: int | None, packet_id: int | None) -> None:
+    """有 from_id 與 packet_id 時標記已處理（過濾、過期、不轉發或已轉發皆計入一次）。"""
+    if from_id is not None and packet_id is not None:
+        _dedup_mark_seen(from_id, packet_id)
+
+
+def _log_expired_packet(
+    topic: str,
+    rx_time: int | None,
+    age_seconds: int | None,
+) -> None:
+    rx_local = (
+        time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(rx_time))
+        if rx_time is not None
+        else "unknown"
+    )
+    now_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    logger.warning(
+        "過濾(過期): topic=%s packet_rx_time_local=%s packet_rx_time_epoch=%s now_local=%s packet_age=%ss max_age=%ss reason=packet_too_old",
+        topic,
+        rx_local,
+        rx_time if rx_time is not None else "unknown",
+        now_str,
+        age_seconds if age_seconds is not None else "unknown",
+        RX_TIME_MAX_AGE_SECONDS,
+    )
+
+
 # ---------------------------------------------------------------------------
 # 過濾：topic 規則、封包 from / rx_time / ignoreId
 # ---------------------------------------------------------------------------
@@ -103,7 +131,8 @@ def _dedup_mark_seen(from_id: int, packet_id: int) -> None:
 def should_drop(config: dict, topic: str) -> tuple[bool, str | None]:
     """
     依 topic 規則判斷是否丟棄。回傳 (是否丟棄, 原因或 None)。
-    原因: topic_contains_json / topic_ignoreId / topic_invalid_node_or_map
+    原因: topic_contains_json / topic_exclude_node_id_prefix / topic_ignoreId / topic_invalid_node_or_map
+    與封包 from 一致：節點 id hex 前綴（EXCLUDE_NODE_ID_CONTAINS）優先於 ignoreId。
     """
     parts = topic.rstrip("/").split("/")
     last = parts[-1] if parts else ""
@@ -112,6 +141,13 @@ def should_drop(config: dict, topic: str) -> tuple[bool, str | None]:
     for kw in EXCLUDE_TOPIC_CONTAINS:
         if kw in topic:
             return True, "topic_contains_json"
+    # 最後一段 !nodeid：hex 前綴排除須先於 ignoreId（與 should_drop_by_packet_from 順序一致）
+    if last.startswith("!"):
+        node_hex = last[1:].lower()
+        for kw in EXCLUDE_NODE_ID_CONTAINS:
+            fragment = kw.lstrip("!").lower()
+            if fragment and node_hex.startswith(fragment):
+                return True, "topic_exclude_node_id_prefix"
     ignore_ids = [s.strip() for s in filt.get("ignoreId", []) if s]
     if ignore_ids and last.startswith("!"):
         node_id = last[1:]
@@ -133,6 +169,7 @@ def should_drop_by_packet_from(
     """
     解包 ServiceEnvelope，依 rx_time 過期、from 規則判斷是否丟棄，並回傳 from_id / packet_id 供去重用。
     回傳 (是否丟棄, from_id 或 None, packet_id 或 None, 是否因過期丟棄, rx_time 或 None, age_seconds 或 None)。
+    from 比對順序：過期 → EXCLUDE_NODE_ID_CONTAINS（hex 前綴）→ filter.ignoreId。
     """
     try:
         se = mqtt_pb2.ServiceEnvelope()
@@ -175,7 +212,7 @@ def should_drop_by_packet_from(
                 return (
                     True,
                     from_id,
-                    None,
+                    packet_id,
                     False,
                     int(rx_time) if rx_time else None,
                     age_seconds,
@@ -184,12 +221,11 @@ def should_drop_by_packet_from(
             s.strip() for s in config.get("filter", {}).get("ignoreId", []) if s
         ]
         for s in ignore_ids_raw:
-            s_lower = s.lower()
-            if from_id_str == s or from_hex == s_lower:
+            if from_id_str == s or from_hex == s.lower():
                 return (
                     True,
                     from_id,
-                    None,
+                    packet_id,
                     False,
                     int(rx_time) if rx_time else None,
                     age_seconds,
@@ -215,6 +251,48 @@ def _topic_str(message) -> str:
     """取得訊息的 topic 字串（相容 aiomqtt 的 Topic 物件）。"""
     t = message.topic
     return getattr(t, "value", t) if t is not None else ""
+
+
+def is_supported_meshtastic_topic_shape(topic: str) -> bool:
+    """
+    是否為支援的 Meshtastic TW topic 形狀（依路徑分段，非單純子字串搜尋）。
+    對應常見結構（+ 表示實際發佈時的一層 topic）：
+      msh/TW/2/e/+/+、msh/TW/2/json/+/+、msh/TW/2/map/+
+      msh/TW/+/2/e/+/+、msh/TW/+/2/json/+/+、msh/TW/+/2/map/+
+      msh/TW/+/+/2/e/+/+、msh/TW/+/+/2/json/+/+、msh/TW/+/+/2/map/+
+      msh/TW/+/+/+/2/e/+/+、msh/TW/+/+/+/2/json/+/+、msh/TW/+/+/+/2/map/+
+    約定：2/e、2/json 在種類後至少還有兩層。2/map 僅接受 .../2/map/（整段 topic 必須以 / 結尾），不會出現 .../2/map 無尾端斜線。
+    """
+    parts = [p for p in topic.split("/") if p != ""]
+    if len(parts) < 4:
+        return False
+    if parts[0] != "msh" or parts[1] != "TW":
+        return False
+
+    def branch_from_2_at(i: int) -> bool:
+        """parts[i] == \"2\"，且 parts[i+1] 為 e | json | map，後綴段數符合。"""
+        if i + 1 >= len(parts):
+            return False
+        kind = parts[i + 1]
+        if kind == "e" or kind == "json":
+            return len(parts) >= i + 4  # 2, kind 之後至少兩層
+        if kind == "map":
+            if not topic.endswith("/"):
+                return False
+            return (
+                len(parts) >= i + 2
+            )  # .../2/map/（尾端 / 表示最後一層空，split 無額外段）
+        return False
+
+    if parts[2] == "2":
+        return branch_from_2_at(2)
+    if len(parts) >= 5 and parts[3] == "2":
+        return branch_from_2_at(3)
+    if len(parts) >= 6 and parts[4] == "2":
+        return branch_from_2_at(4)
+    if len(parts) >= 7 and parts[5] == "2":
+        return branch_from_2_at(5)
+    return False
 
 
 def _forward_topic(topic: str, prefixes: tuple[str, ...] | None = None) -> str | None:
@@ -321,9 +399,8 @@ def _validate_local_config(config: dict) -> None:
 # ---------------------------------------------------------------------------
 
 
-async def run_async():
+async def run_async(config: dict) -> None:
     global _online_nodes, _online_nodes_updated
-    config = load_config(CONFIG_PATH)
     _validate_local_config(config)
 
     source_cfg = config.get("source", {})
@@ -380,6 +457,8 @@ async def run_async():
                         payload = message.payload
                         if not payload:
                             continue
+                        qos = message.qos or 0
+                        retain = message.retain or False
                         (
                             dropped_by_from,
                             from_id,
@@ -388,32 +467,30 @@ async def run_async():
                             rx_time,
                             age_seconds,
                         ) = should_drop_by_packet_from(config, payload)
+                        # 1. 不支援的路徑（非預期 msh/TW/... 分段形狀或 path 萃取失敗）→ 略過
+                        if not is_supported_meshtastic_topic_shape(topic):
+                            logger.warning("過濾(unsupported_path): %s", topic)
+                            continue
+                        main_path = _forward_topic(topic, MAIN_PATH_PREFIXES)
+                        if main_path is None:
+                            logger.warning(
+                                "過濾(unsupported_path): %s (path 萃取失敗)", topic
+                            )
+                            continue
+                        # 2. 丟棄過期封包
+                        if dropped_by_from and expired:
+                            _log_expired_packet(topic, rx_time, age_seconds)
+                            continue
+                        # 3. 丟棄已處理過的封包（去重）
+                        if (
+                            from_id is not None
+                            and packet_id is not None
+                            and _dedup_is_duplicate(from_id, packet_id)
+                        ):
+                            continue
+                        # 4. 封包層過濾 → 略過
                         if dropped_by_from:
-                            if expired:
-                                rx_time_str = (
-                                    time.strftime(
-                                        "%Y-%m-%d %H:%M:%S", time.localtime(rx_time)
-                                    )
-                                    if rx_time is not None
-                                    else "unknown"
-                                )
-                                now_local_str = time.strftime(
-                                    "%Y-%m-%d %H:%M:%S", time.localtime()
-                                )
-                                logger.warning(
-                                    "過濾(過期): topic=%s packet_rx_time_local=%s packet_rx_time_epoch=%s now_local=%s packet_age=%ss max_age=%ss reason=packet_too_old",
-                                    topic,
-                                    rx_time_str,
-                                    rx_time if rx_time is not None else "unknown",
-                                    now_local_str,
-                                    (
-                                        age_seconds
-                                        if age_seconds is not None
-                                        else "unknown"
-                                    ),
-                                    RX_TIME_MAX_AGE_SECONDS,
-                                )
-                            elif from_id is not None:
+                            if from_id is not None:
                                 from_hex = format(from_id, "08x").lower()
                                 logger.warning(
                                     "過濾(ignoreId/from): topic=%s from=%s (!%s)",
@@ -421,28 +498,15 @@ async def run_async():
                                     from_id,
                                     from_hex,
                                 )
+                            _dedup_mark_seen_if_present(from_id, packet_id)
                             continue
+                        # 5. topic 層過濾 → 略過
                         drop_topic, drop_reason = should_drop(config, topic)
                         if drop_topic and drop_reason:
                             logger.warning("過濾(%s): %s", drop_reason, topic)
+                            _dedup_mark_seen_if_present(from_id, packet_id)
                             continue
-                        main_path = _forward_topic(topic, MAIN_PATH_PREFIXES)
-                        if main_path is None:
-                            logger.warning("過濾(topic_not_forward): %s", topic)
-                            continue
-                        if (
-                            from_id is not None
-                            and packet_id is not None
-                            and _dedup_is_duplicate(from_id, packet_id)
-                        ):
-                            logger.warning(
-                                "去重: topic=%s from=%s id=%s",
-                                topic,
-                                from_id,
-                                packet_id,
-                            )
-                            continue
-                        # Fan-out：定期更新在線節點
+                        # 6. 轉發至本地 EMQX；定期刷新在線節點後 fan-out（僅 /2/e/）
                         if (
                             time.monotonic() - _online_nodes_updated
                         ) > ONLINE_NODES_REFRESH_SECONDS:
@@ -464,11 +528,10 @@ async def run_async():
                         await local_client.publish(
                             main_topic,
                             payload=payload,
-                            qos=message.qos or 0,
-                            retain=message.retain or False,
+                            qos=qos,
+                            retain=retain,
                         )
-                        if from_id is not None and packet_id is not None:
-                            _dedup_mark_seen(from_id, packet_id)
+                        _dedup_mark_seen_if_present(from_id, packet_id)
                         # 僅 path 以 /2/e/ 開頭時才 fan-out 給節點（/2/json/、/2/map 只發 main）
                         sender_node_id = (
                             "!" + format(from_id, "08x").lower()
@@ -487,8 +550,8 @@ async def run_async():
                                 await local_client.publish(
                                     target,
                                     payload=payload,
-                                    qos=message.qos or 0,
-                                    retain=message.retain or False,
+                                    qos=qos,
+                                    retain=retain,
                                 )
                                 sent_count += 1
                             logger.info(
@@ -522,7 +585,7 @@ def main() -> None:
         format="%(levelname)s [%(name)s] %(message)s",
         stream=sys.stdout,
     )
-    asyncio.run(run_async())
+    asyncio.run(run_async(config))
 
 
 if __name__ == "__main__":
