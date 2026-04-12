@@ -24,9 +24,11 @@ local:
   # api_key / api_secret 由環境變數 MESHGATE_BROKER_API_KEY、MESHGATE_BROKER_API_SECRET 提供
   api_url: "http://meshgate-broker:18083"
 
-# 過濾規則（ignoreId 為解包後依 from 排除）
+# 過濾規則（依封包 from 十進位或 hex 比對）
 filter:
-  ignoreId:
+  # 不轉發至本地 EMQX
+  ignoreIdDropOnly:
     - "2661414656" # !9ea1f700 🍁番仔園
     - "2997292716" # !b2a70eac MeshAI 🔌天台🔌
     - "3082834280" # !b7c05168 BTC-BOT
+    - "53454888" # !032fa828 GAT562 a828
